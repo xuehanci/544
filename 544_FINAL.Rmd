@@ -1,0 +1,368 @@
+---
+title: "Predict patient's extent of cognitive impairment and identify most important determined measures "
+author: "Jennifer Ci"
+output: pdf_document
+date: "2022-12-04"
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# 1 Question and background information on the data
+
+The dataset that we will look at merges together several of the key
+variables from various case report forms and biomarker lab summaries
+across the Alzheimer Disease Neuroimaging Initiative (ADNI).
+Specifically, it contains demographic information like age, gender and
+education level, cognitive test scores like MMSE, Montreal Cognitive
+Assessment (MoCA) and CDR-SB, and cerebrospinal fluid markers like total
+tau (t-tau), phospho-tau (p-tau) and Abeta42, as well as the diagnosis
+group information which is the outcome we are interested. This ordinal
+outcome variable describes the extent of cognitive impairment which from
+having least severe cognitive impairment to having most severe cognitive
+impairment are Cognitive Normal (CN), Significant Memory Concern (SMC),
+Early Mild cognitive impairment (EMCI), Late Mild cognitive impairment
+(LMCI) and Dementia (AD). Though it's a longitudinal dataset, we will
+only focus on the baseline values for the purpose of this analysis which
+is to find out the predictors significant in predicting the cognitive
+impairment level.
+
+## 1.1 Loading all the necessary packages and dataset.
+```{r echo=T, message=FALSE, warning=FALSE, results='hide'}
+##-------------Load data
+biomarker_merged <- read.csv("~/Desktop/Biostat/BIOST_544/final_project/ADNIMERGE.csv", 
+                             comment.char="#",na.strings=c("","NA"))
+##-------------Package
+library(dplyr)
+library(stringr)
+library(readr)
+library(ordinalForest)
+library(missForest)
+library(naniar)
+library(tidyr)
+library(purrr)
+library(ggplot2)
+library(randomForest)
+library(ranger)
+```
+
+## 1.2 Cleaning the data
+
+The original dataset contains 16037 observation with 116 variables.
+After including only the baseline datapoints and excluding useless
+variables like subject ID, we left with 2396 observations and 49
+variables.
+
+```{r echo=T, message=FALSE, warning=FALSE, results='hide'}
+#filter baseline
+baseline<-filter(biomarker_merged,VISCODE=="bl")
+str_detect(colnames(baseline),"bl")
+col_index<-which(!str_detect(colnames(baseline),"bl"))
+baseline_sub<-baseline[,col_index]
+
+baseline_sub$DX<-baseline$DX_bl
+baseline_sub$DX<-as.factor(baseline_sub$DX)
+baseline_sub<-filter(baseline_sub,DX !="")
+
+
+#And exclude the variables containing ID information
+#I also exclude variables "PTETHCAT","PTRACCAT","PTMARRY" since I don’t think 
+#they are useful in our prediction model 
+baseline_sub2 <- baseline_sub[,-which(names(baseline_sub) %in% 
+                                        c("VISCODE","update_stamp","SITE","RID",
+                                          "PTID","ORIGPROT","COLPROT","Month","M",
+                                          "FSVERSION","FLDSTRENG","EXAMDATE",
+                                          "LDELTOTAL_BL","PTETHCAT","PTRACCAT",
+                                          "PTMARRY","IMAGEUID"))]
+
+```
+
+# 2 Features
+
+## 2.1 Scientific meaning of important variables in this dataset:
+
+AGE Age at baseline\
+PTGENDER Sex\
+PTEDUCAT Education\
+CDRSB (Clinical Dementia Rating)\
+MMSE (Mini Mental State Exam)\
+FAQ (Functional Assessment Questionnaire)\
+LDELTOTAL (Logical Memory - Delayed Recall)\
+mPACCtrailsB (ADNI modified Preclinical Alzheimer's Cognitive Composite
+(PACC) with Trails B)\
+mPACCdigit (ADNI modified Preclinical Alzheimer's Cognitive Composite
+(PACC) with Digit Symbol Substitution)\
+EcogSPTotal (total everyday cognition test score)\
+EcogSPPlan (everyday cognition test score upon plan function)\
+EcogSPMem (everyday cognition test score upon memory function)\
+EcogSPLang (everyday cognition test score upon language function)\
+EcogSPVisspat (everyday cognition test score upon visual and spatial
+function)
+
+The full description of the variable information can be found at
+<https://adni.bitbucket.io/reference/adnimerge.html>.
+
+## 2.2 Converting the remaining variables properly into numeric or factor.
+
+```{r echo=T, message=FALSE, warning=FALSE, results='hide'}
+#Converting the original dataset to numeric or factor
+baseline_sub2$PTGENDER=as.factor(baseline_sub2$PTGENDER)
+baseline_sub2$APOE4<-as.factor(baseline_sub2$APOE4)
+
+ turn_to_numeric=function(a){
+   a=as.numeric(a)
+ }
+
+baseline_sub2[,-which(names(baseline_sub2)%in%c("DX","PTGENDER","APOE4"))]<-
+  apply(baseline_sub2[,-which(names(baseline_sub2)%in%
+                                c("DX","PTGENDER","APOE4"))],2,turn_to_numeric)
+```
+
+## 2.3 Numerical/Categorical Variables
+
+The current dataset contains 46 numeric variables and 3 categorical
+variables. The density plots are shown below for the numeric variables.
+Among the predictors, there are categorical variables like "PTGENDER"
+(indicator variable of gender), APOE4 (Number of APOEe4 alleles: 0, 1,
+2) and continuous variables like age in years, education in years. The outcome 
+variable DX is one of the categorical variable.
+
+```{r fig.height=10, fig.width=8, message=FALSE, warning=FALSE}
+
+sapply(baseline_sub2, is.numeric) %>% 
+  which() %>% 
+  names()
+
+sapply(baseline_sub2, is.factor) %>% 
+  which() %>% 
+  names()
+  
+baseline_sub2 %>%
+  keep(is.numeric) %>% 
+  gather() %>% 
+  ggplot(aes(value)) +
+    facet_wrap(~ key, scales = "free") +
+    geom_histogram()
+
+```
+
+# 3 Missing values
+
+Data columns with too many missing values won't be of much value,
+therefore we have to check if there is any missing value in our dataset.
+So there are 2396 rows/observations which has missing values in at least
+one of the variables recorded, which is the entire population. We cannot
+delete all the observations with any missingness, by doing that, we will
+lose all of the data and the information in it.
+
+```{r}
+mis_rows=which(complete.cases(baseline_sub2)==FALSE)
+length(mis_rows)
+```
+
+The following figure shows the percentage of missingness for each of the
+remaining 49 variables, The final outcome DX doesn't have any missing observations. 
+We will first exclude the three variables "PIB",
+"FBB" and "DIGITSCOR", which have more than 60% missing values.
+
+```{r fig.height=6, message=FALSE, warning=FALSE}
+naniar::gg_miss_var(baseline_sub2, show_pct = TRUE)
+
+```
+
+```{r message=FALSE, warning=FALSE}
+#Exclude variables "PIB""FBB""DIGITSCOR" due to their large missingness
+baseline_sub2<-baseline_sub2%>% select (-c("PIB","FBB","DIGITSCOR"))
+```
+
+For the remaining 46 variables, we then imputed the missing values in the predictors using the
+missForest algorithm.
+
+```{r}
+#missingness
+set.seed(101)
+data.imp.covariates <- missForest(xmis=baseline_sub2[,-which(names(baseline_sub2)%in%
+                                                               c("DX"))], maxiter = 50)$ximp
+# imputes the missing values in the covariates using random forest, COLPROT not important
+data <- cbind(data.imp.covariates, DX=baseline_sub2[,which(names(baseline_sub2)%in%
+                                                             c("DX"))]) # returns the imputed dataset
+```
+
+```{r echo=T, message=FALSE, warning=FALSE, results='hide'}
+######################## Model building ############################
+data=data[!data$DX=="",]
+str(data)
+data$DX=as.factor(data$DX); levels(data$DX)=c("4","0","2","3","1")
+```
+
+```{r}
+table(data$DX)
+data[,c("PTGENDER","PTEDUCAT","APOE4")] <- lapply(data[,c("PTGENDER","PTEDUCAT",
+                                                          "APOE4")], factor)
+```
+
+# 4 Data Partitioning
+
+Before applying any methods to chosen variables, dataset should be
+divided into two subsets: train and test. Training sample is used to
+train the model, while test sample is used for making the predictions
+and verify performance of the model. The entire (imputed) dataset will
+be splitting into a training and a test set with 70% and 30%
+observations respectively.
+
+```{r}
+#split the data
+set.seed(1)
+index <- sample(2,nrow(data),replace = TRUE,prob=c(0.7,0.3))
+datatrain <- data[index==1,]
+datatest<- data[index==2,]
+
+
+```
+
+# 5 Classification method
+
+We will use both Ordinal Forest method from the r package `ordinalForest` and classical random forest method from the r package `ranger`, comparing the performance of the two methods.
+The ordinal forest method is a random forest-based prediction method
+for ordinal response variables. Based on our understanding, classical random forest method is not appropriate for ordinal response data since it ignores the ordering in the levels and implements standard classification trees and will lead to loss information.
+
+## 5.1 Ordinal forest
+
+More information on the r package ‘ordinalForest’ can be find here:  https://cran.r-project.org/web/packages/ordinalForest/ordinalForest.pdf
+
+### Train the data
+
+Based on the Ordinal Forest method, the top 10 significant predictors are
+CDRSB(Clinical Dementia Rating), mPACCtrailsB(ADNI modified Preclinical Alzheimer's Cognitive Composite
+(PACC) with Trails B), mPACCdigit(ADNI modified Preclinical Alzheimer's Cognitive Composite
+(PACC) with Digit Symbol Substitution), MMSE(Mini Mental State Exam), LDELTOTAL(Logical Memory - Delayed Recall),EcogSPTotal(total everyday cognition test score),
+EcogSPPlan(everyday cognition test score upon plan function), EcogSPMem(everyday cognition test score upon memory function), FAQ(Functional Assessment Questionnaire)), and EcogSPVisspat(everyday cognition test score upon visual and spatial
+function).
+
+```{r message=FALSE, warning=FALSE}
+# Construct OF prediction rule using the training dataset:
+set.seed(123)
+ordforres <- ordfor(depvar="DX", data=datatrain, nsets=1000, ntreeperdiv=100, 
+                    ntreefinal=5000, perffunction = "equal")
+set.seed(123)
+ordforres1 <- ordfor(depvar="DX", data=datatrain, nsets=1000, ntreeperdiv=100, 
+                    ntreefinal=5000, perffunction="probability")
+
+# Study variable importance values:
+set.seed(123)
+sort(ordforres$varimp, decreasing=TRUE)
+```
+
+The following three boxplots are the spreading of the top three most
+important predictors among the five extent of cognitive impairment
+outcome groups. Participants with Alzheimenr's disease overall has the highest 
+average CDRSB, lowest mPACCtrailsB and lowest mPACCdigit.
+
+```{r message=FALSE, warning=FALSE}
+
+# Take a closer look at the top variables:
+datatrain$DX <- factor(datatrain$DX, levels=c("0", "1", "2", "3", "4"))
+
+boxplot(datatrain$CDRSB ~ datatrain$DX,ylab="DX",xlab="CDRSB", horizontal=TRUE, 
+        names=c("CN","SMC","EMCI","LMCI","AD"),las=1)
+
+boxplot(datatrain$mPACCtrailsB ~ datatrain$DX, ylab="DX",xlab="mPACCtrailsB",
+        horizontal=TRUE,names=c("CN","SMC","EMCI","LMCI","AD"),las=1)
+
+boxplot(datatrain$mPACCdigit ~ datatrain$DX, ylab="DX",xlab="mPACCdigit",horizontal=TRUE, 
+        names=c("CN","SMC","EMCI","LMCI","AD"),las=1)
+```
+
+### Test the prediction model
+```{r message=FALSE, warning=FALSE, include=FALSE}
+# Predict values of the ordinal target variable in the test dataset:
+preds <- predict(ordforres, newdata=datatest[,-46])
+preds$ypred
+
+preds1 <- predict(ordforres1, newdata=datatest[-46])
+preds1$classprobs
+
+```
+
+### Evaluation of model accuracy
+The model accuracy will be assessed through confusion matrix and missclassification rate.
+```{r message=FALSE, warning=FALSE}
+# Compare predicted values with true values:
+
+testDX = factor(datatest$DX,levels = c(0,1,2,3,4),labels = c("CN", " SMC", 
+                                                                  "EMCI","LMCI", "AD"))
+
+preds$ypred = factor(preds$ypred,levels = c(0,1,2,3,4),labels = c("CN", " SMC",  
+                                                                  "EMCI","LMCI", "AD"))
+
+
+tab<-table(data.frame(true_values=testDX, predictions=preds$ypred))
+tab
+require(caret)
+cm<-confusionMatrix(testDX, preds$ypred)
+overall <- cm$overall
+overall.accuracy <- overall['Accuracy'] 
+1-sum(diag(tab))/sum(tab)
+cm
+round(overall['Accuracy'],3)
+
+```
+The prediction using test data showed that accuracy for Ordinal Forest is `r round(overall['Accuracy'],3)`, and the missclassification rate is `r round((1-sum(diag(tab))/sum(tab)),3)`.
+
+## 5.2 Random Forest - ranger
+
+### Train the data
+
+```{r}
+set.seed(123)
+rfr=ranger(DX ~ ., data = datatrain, importance = "permutation", classification=TRUE) 
+# Finding which predictors are significant
+set.seed(123)
+imprfr<-importance_pvalues(rfr, method = "altmann", formula = DX ~ ., data = datatrain)
+imprfr
+
+```
+
+The top 10 important predictors by using random forest- ranger() are CDRSB(Clinical Dementia Rating), LDELTOTAL(Logical Memory - Delayed Recall), mPACCtrailsB(ADNI modified Preclinical Alzheimer's Cognitive Composite
+(PACC) with Trails B), mPACCdigit(ADNI modified Preclinical Alzheimer's Cognitive Composite
+(PACC) with Digit Symbol Substitution), EcogSPMem(everyday cognition test score upon memory function), EcogSPTotal(total everyday cognition test score), EcogSPPlan(everyday cognition test score upon plan function), MMSE(Mini Mental State Exam), FAQ(Functional Assessment Questionnaire), and EcogPtTotal(total everyday cognition test score). Within the 45 predictors, there are 5 predictors have p-value less than 0.05 for the variable importance: PTGENDER (p=0.099)
+APOE4 (p-value=0.188), RAVLT_forgetting (p-value=0.455), Ventricles (p-value=0.109), WholeBrain (p-value= 0.059), so we conclude that these variables are not significant predictors for determining the patient's extent of cognitive impairment.
+
+
+### Test the prediction model
+
+```{r}
+# Predicting the responses in the test set and obtaining the misclassification
+# error rate
+pred_rfr0=predict(rfr, data=as.data.frame(datatest[,-46]), type="response")
+
+pred_rfr=pred_rfr0$predictions
+```
+
+### Evaluation of model accuracy
+```{r}
+pred_rfr = factor(pred_rfr,levels = c(0,1,2,3,4),labels = c("CN", " SMC","EMCI",
+                                                            "LMCI", "AD"))
+
+tabr<-table(testDX,pred_rfr)
+
+1-sum(diag(tabr))/sum(tabr)
+
+cm2<-confusionMatrix(testDX, pred_rfr)
+overall2 <- cm2$overall
+overall2.accuracy <- overall2['Accuracy'] 
+1-sum(diag(tabr))/sum(tabr)
+cm2
+round(overall2['Accuracy'],3)
+```
+The prediction using test data showed that accuracy for Random Forest using `ranger()` is `r round(overall2['Accuracy'],3)`, and the missclassification rate is `r round((1-sum(diag(tabr))/sum(tabr)),3)`.
+
+
+
+## Conclusions 
+Both models have CDRSB, mPACCtrailsB, mPACCdigit, MMSE, LDELTOTAL, EcogSPTotal,EcogSPPlan, EcogSPMem, FAQ as their top ten significant predictors. To our surprise, the top 10 significant predictors for both models are all important cognitive test scores. The widely accepted AD biomarkers like ABETA, TAU and PTAU are not among them. 
+In summary, our two models have similar prediction accuracy. However, it was surprised to us that Random Forest using `ranger()` performed better with `r round(overall2['Accuracy'],3)` accuracy and `r round((1-sum(diag(tabr))/sum(tabr)),3)`missclassification rate, than Ordinal Forest with`r round(overall['Accuracy'],3)` accuracy and `r round((1-sum(diag(tab))/sum(tab)),3)` missclassification rate.
